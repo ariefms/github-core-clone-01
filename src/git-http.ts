@@ -11,7 +11,6 @@ import {
   pktLine,
   readPack,
   writePack,
-  type GitObject,
   type Pkt,
 } from './git-core.ts';
 import { Forge, type Repo } from './store.ts';
@@ -164,6 +163,11 @@ function ancestors(forge: Forge, repo: Repo, tips: readonly string[]): Set<strin
 function isFastForward(forge: Forge, repo: Repo, oldOid: string, newOid: string): boolean {
   if (oldOid === newOid) return true;
   if (oldOid === ZERO_OID) return true;
+  // A linear push's old tip is the new commit's parent: O(1) instead of
+  // walking the whole chain. The full walk stays as the fallback for
+  // deeper ancestry and non-linear histories.
+  const head = forge.commitOf(repo, newOid);
+  if (head !== null && head.parents.includes(oldOid)) return true;
   const seen = ancestors(forge, repo, [newOid]);
   return seen.has(oldOid);
 }
@@ -272,21 +276,23 @@ function fetchResponse(forge: Forge, repo: Repo, request: FetchRequest, v2: bool
     return { status: 200, body: cached.body, contentType: UPLOAD_RESULT_CT };
   }
   const selection = forge.fetchSelection(repo, request.wants, request.haves, request.shallow, request.depth);
-  // The selection holds the same object references as repo.objects, so the
-  // oid for each object comes from the map key. Sort by oid for a
-  // deterministic pack.
-  const oidByObject = new Map<GitObject, string>();
-  for (const [oid, object] of repo.objects) oidByObject.set(object, oid);
-  const sorted = [...selection.objects].sort((a, b) => {
-    const aOid = oidByObject.get(a) ?? '';
-    const bOid = oidByObject.get(b) ?? '';
-    return aOid < bOid ? -1 : aOid > bOid ? 1 : 0;
-  });
+  // The selection already carries each object's oid, so the pack is
+  // sorted by oid without a reverse map over the whole repo.
+  const sorted = [...selection.objects]
+    .sort((a, b) => (a.oid < b.oid ? -1 : a.oid > b.oid ? 1 : 0))
+    .map((entry) => entry.object);
   const pack = writePack(sorted);
-  // ACKs: haves that are ancestors of the wants.
-  const wantCommits = request.wants.filter((w) => isCommit(forge, repo, w));
-  const wantAncestors = ancestors(forge, repo, wantCommits);
-  const acks = request.haves.filter((h) => wantAncestors.has(h) && isCommit(forge, repo, h));
+  // ACKs: haves that are ancestors of the wants. With no haves there is
+  // nothing to acknowledge, so the ancestor walk is skipped entirely
+  // (the clone path: 200 commits walked for an empty result before).
+  const acks: string[] = [];
+  if (request.haves.length > 0) {
+    const wantCommits = request.wants.filter((w) => isCommit(forge, repo, w));
+    const wantAncestors = ancestors(forge, repo, wantCommits);
+    for (const h of request.haves) {
+      if (wantAncestors.has(h) && isCommit(forge, repo, h)) acks.push(h);
+    }
+  }
   const parts: Buffer[] = [];
   if (v2) {
     parts.push(pktText('acknowledgments'));

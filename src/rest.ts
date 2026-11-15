@@ -155,7 +155,7 @@ export function handleRest(forge: Forge, ctx: RestContext): RestResult {
 function routeRest(forge: Forge, ctx: RestContext): RestResult {
   const { method } = ctx;
   // The path arrives as /api/v3/...; strip the prefix, keep the full path for links.
-  const all = ctx.pathname.split('/').filter((s) => s !== '').map((s) => decodeURIComponent(s));
+  const all = ctx.pathname.split('/').filter((s) => s !== '').map((s) => (s.includes('%') ? decodeURIComponent(s) : s));
   const segments = all[0] === 'api' && all[1] === 'v3' ? all.slice(2) : all;
   if (!authorized(ctx)) return err(401, 'Bad credentials');
   const { value: body, bad } = parseBody(ctx);

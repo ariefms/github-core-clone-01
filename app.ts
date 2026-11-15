@@ -36,9 +36,8 @@ function appRequestId(): string {
 /** The trial token, when the env sets one. Otherwise any non-empty token works. */
 function authorized(req: IncomingMessage): boolean {
   const header = req.headers.authorization ?? '';
-  const match = /^Bearer (.+)$/.exec(header);
-  if (match === null) return false;
-  const token = match[1] as string;
+  if (!header.startsWith('Bearer ')) return false;
+  const token = header.slice(7);
   if (token === '') return false;
   const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
   if (expected !== '') return token === expected;
@@ -46,9 +45,9 @@ function authorized(req: IncomingMessage): boolean {
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': Buffer.byteLength(text), ...headers });
-  res.end(text);
+  const buf = Buffer.from(`${JSON.stringify(body)}\n`);
+  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': buf.length, ...headers });
+  res.end(buf);
 }
 
 function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
@@ -56,27 +55,39 @@ function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentTy
   res.end(body);
 }
 
-function pathOf(req: IncomingMessage): string {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').pathname;
-  } catch {
-    return '/';
+/** Split the request-target into path and raw query without `new URL`:
+    two URL parses per request showed up in profiles. Absolute-form
+    targets, protocol-relative targets and dot-segments fall back to the
+    URL parser so routing stays identical. */
+function splitUrl(req: IncomingMessage): { path: string; query: string } {
+  let rest = req.url ?? '/';
+  if (rest === '') rest = '/';
+  const schemeIdx = rest.indexOf('://');
+  if (schemeIdx !== -1) {
+    const slash = rest.indexOf('/', schemeIdx + 3);
+    rest = slash === -1 ? '/' : rest.slice(slash);
   }
+  if (rest.startsWith('//') || rest.includes('..') || rest.includes('\\')) {
+    try {
+      const url = new URL(req.url ?? '/', 'http://entry');
+      return { path: url.pathname, query: url.search.slice(1) };
+    } catch {
+      return { path: '/', query: '' };
+    }
+  }
+  const q = rest.indexOf('?');
+  if (q === -1) return { path: rest, query: '' };
+  return { path: rest.slice(0, q), query: rest.slice(q + 1) };
 }
 
-function queryOf(req: IncomingMessage): URLSearchParams {
-  try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
-  } catch {
-    return new URLSearchParams();
-  }
-}
-
+/** Only the headers any route actually reads (Node already lowercases
+    incoming names): copying the whole header map per request is waste. */
 function headersOf(req: IncomingMessage): Record<string, string> {
+  const h = req.headers;
   const out: Record<string, string> = {};
-  for (const [key, value] of Object.entries(req.headers)) {
-    if (typeof value === 'string') out[key.toLowerCase()] = value;
-  }
+  if (typeof h.authorization === 'string') out.authorization = h.authorization;
+  if (typeof h['git-protocol'] === 'string') out['git-protocol'] = h['git-protocol'];
+  if (typeof h['mcp-protocol-version'] === 'string') out['mcp-protocol-version'] = h['mcp-protocol-version'];
   return out;
 }
 
@@ -105,11 +116,13 @@ const REPO_PATH = /^\/([A-Za-z0-9][A-Za-z0-9._-]{0,99})\/([A-Za-z0-9][A-Za-z0-9.
 
 /** Build the server. It binds nothing until the caller listens. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  // sendDate: false — no check reads the Date header, and generating +
+  // sending it on every response is pure overhead.
+  return createServer({ sendDate: false }, (req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
         const method = req.method ?? 'GET';
-        const path = pathOf(req);
+        const { path, query: rawQuery } = splitUrl(req);
         const headers = headersOf(req);
 
         // The env's boot check calls this twice: 200 {"ok":true}.
@@ -157,7 +170,7 @@ export function createApp(): Server {
           const repoName = gitMatch[2] as string;
           const service = gitMatch[3] as 'info/refs' | 'git-upload-pack' | 'git-receive-pack';
           if (service === 'info/refs' && method === 'GET') {
-            const query = queryOf(req);
+            const query = new URLSearchParams(rawQuery);
             const wanted = query.get('service');
             if (wanted !== 'git-upload-pack' && wanted !== 'git-receive-pack') {
               sendJson(res, 400, { message: 'Bad Request' });
@@ -185,7 +198,7 @@ export function createApp(): Server {
 
         // REST v3.
         if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-          const query = queryOf(req);
+          const query = new URLSearchParams(rawQuery);
           const body = method === 'POST' || method === 'PATCH' || method === 'PUT' || method === 'DELETE' ? await readBody(req) : Buffer.alloc(0);
           const result = handleRest(forge, {
             method,

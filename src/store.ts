@@ -354,7 +354,7 @@ export class Forge {
     haves: readonly string[],
     shallow: readonly string[],
     depth: number | undefined,
-  ): { objects: GitObject[]; shallowOut: string[]; unshallowOut: string[] } {
+  ): { objects: Array<{ oid: string; object: GitObject }>; shallowOut: string[]; unshallowOut: string[] } {
     const shallowSet = new Set(shallow);
     // Held commits: the haves' full ancestry, cut at shallow boundaries.
     const held = new Set<string>();
@@ -386,13 +386,16 @@ export class Forge {
         wantCommits.push(want);
       }
     }
-    // BFS from the wants with the depth cap.
+    // BFS from the wants with the depth cap. Index pointer instead of
+    // queue.shift(): shift() is O(n) per dequeue on a long chain.
     const included = new Set<string>();
     const boundary = new Set<string>();
     const visited = new Set<string>();
     const queue: Array<{ oid: string; d: number }> = wantCommits.map((oid) => ({ oid, d: 1 }));
-    while (queue.length > 0) {
-      const current = queue.shift() as { oid: string; d: number };
+    let queueIndex = 0;
+    while (queueIndex < queue.length) {
+      const current = queue[queueIndex] as { oid: string; d: number };
+      queueIndex += 1;
       if (visited.has(current.oid)) continue;
       visited.add(current.oid);
       const commit = this.commitOf(repo, current.oid);
@@ -428,10 +431,10 @@ export class Forge {
     const send = new Set<string>();
     for (const oid of wantObjs) if (!heldObjs.has(oid)) send.add(oid);
     for (const oid of extraObjects) send.add(oid);
-    const objects: GitObject[] = [];
+    const objects: Array<{ oid: string; object: GitObject }> = [];
     for (const oid of send) {
       const object = repo.objects.get(oid);
-      if (object !== undefined) objects.push(object);
+      if (object !== undefined) objects.push({ oid, object });
     }
     return { objects, shallowOut: [...boundary], unshallowOut: [...unshallow] };
   }

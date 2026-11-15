@@ -240,6 +240,27 @@ export function writePack(objects: readonly GitObject[]): Buffer {
  * trailing bytes, so the stream end is found by binary search on the length.
  */
 function inflateAt(buf: Buffer, off: number, size: number): { data: Buffer; next: number } {
+  // One inflate reports how many input bytes the stream consumed
+  // (engine.bytesWritten), so the stream end is found without the
+  // throw-per-probe binary search. Falls back to the search when the
+  // runtime does not report the consumed length (older Node) or the
+  // stream is corrupt, keeping the old error semantics either way.
+  try {
+    const res = zlibInflate(buf.subarray(off), { info: true }) as {
+      buffer: Buffer;
+      engine?: { bytesWritten?: unknown };
+    };
+    const consumed = res.engine?.bytesWritten;
+    if (typeof consumed === 'number' && res.buffer.length === size) {
+      return { data: res.buffer, next: off + consumed };
+    }
+  } catch {
+    // Corrupt stream: the slow path below throws the same error as before.
+  }
+  return inflateAtSlow(buf, off, size);
+}
+
+function inflateAtSlow(buf: Buffer, off: number, size: number): { data: Buffer; next: number } {
   const max = buf.length - off;
   // A deflate stream is at most its output plus a small overhead.
   let hi = Math.min(max, size + 64);
