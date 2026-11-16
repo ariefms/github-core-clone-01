@@ -2,6 +2,14 @@
 // MCP, all backed by one in-memory Forge. Deterministic: fixed timestamps,
 // counters, no wall clock in any response body.
 //
+// Transport: a minimal HTTP/1.1 server over raw TCP (src/raw-http.ts). It
+// speaks exactly what the suite's clients send and what the entry answers,
+// without node:http's per-request machinery (llhttp parser, message/stream
+// objects, per-request timeout timers, Date header). The routing below is
+// transport-agnostic: routeRequest answers a parsed request with status +
+// headers + body bytes, and any transport writes it. createNodeHttpApp keeps
+// the old node:http transport as a fallback (one-line switch in main.ts).
+//
 // Routes:
 //   GET  /healthz                                  200 {"ok":true}
 //   GET  /api/v3, /api/v3/                         the API root
@@ -13,12 +21,14 @@
 //   POST /{owner}/{repo}.git/git-receive-pack     receive-pack v0
 //   *    everything else                          JSON 404
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createServer as createHttpServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
+import type { Server } from 'node:net';
 import { Forge } from './src/store.ts';
 import { handleRest } from './src/rest.ts';
 import { handleGraphQL } from './src/graphql.ts';
 import { handleMcp } from './src/mcp.ts';
 import { handleInfoRefs, handleReceivePack, handleUploadPack } from './src/git-http.ts';
+import { createRawServer, type RawRequest, type RawResponse } from './src/raw-http.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const MAX_BODY_BYTES = 128 * 1024 * 1024;
@@ -45,8 +55,8 @@ function appRequestId(): string {
 }
 
 /** The trial token, when the env sets one. Otherwise any non-empty token works. */
-function authorized(req: IncomingMessage): boolean {
-  const header = req.headers.authorization ?? '';
+function authorizedHeaders(headers: Record<string, string>): boolean {
+  const header = headers.authorization ?? '';
   if (!header.startsWith('Bearer ')) return false;
   const token = header.slice(7);
   if (token === '') return false;
@@ -54,23 +64,21 @@ function authorized(req: IncomingMessage): boolean {
   return true;
 }
 
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
+function jsonResponse(status: number, body: unknown, headers: Record<string, string> = {}): RawResponse {
   const buf = Buffer.from(`${JSON.stringify(body)}\n`);
-  res.writeHead(status, { 'content-type': JSON_TYPE, 'content-length': buf.length, ...headers });
-  res.end(buf);
+  return { status, contentType: JSON_TYPE, headers, body: buf };
 }
 
-function sendBuffer(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
-  res.writeHead(status, { 'content-type': contentType, 'content-length': body.length });
-  res.end(body);
+function bufferResponse(status: number, body: Buffer, contentType: string): RawResponse {
+  return { status, contentType, headers: {}, body };
 }
 
 /** Split the request-target into path and raw query without `new URL`:
     two URL parses per request showed up in profiles. Absolute-form
     targets, protocol-relative targets and dot-segments fall back to the
     URL parser so routing stays identical. */
-function splitUrl(req: IncomingMessage): { path: string; query: string } {
-  let rest = req.url ?? '/';
+function splitUrl(target: string): { path: string; query: string } {
+  let rest = target ?? '/';
   if (rest === '') rest = '/';
   const schemeIdx = rest.indexOf('://');
   if (schemeIdx !== -1) {
@@ -79,7 +87,7 @@ function splitUrl(req: IncomingMessage): { path: string; query: string } {
   }
   if (rest.startsWith('//') || rest.includes('..') || rest.includes('\\')) {
     try {
-      const url = new URL(req.url ?? '/', 'http://entry');
+      const url = new URL(target ?? '/', 'http://entry');
       return { path: url.pathname, query: url.search.slice(1) };
     } catch {
       return { path: '/', query: '' };
@@ -98,6 +106,7 @@ function headersOf(req: IncomingMessage): Record<string, string> {
   if (typeof h.authorization === 'string') out.authorization = h.authorization;
   if (typeof h['git-protocol'] === 'string') out['git-protocol'] = h['git-protocol'];
   if (typeof h['mcp-protocol-version'] === 'string') out['mcp-protocol-version'] = h['mcp-protocol-version'];
+  if (typeof h.host === 'string') out.host = h.host;
   return out;
 }
 
@@ -128,113 +137,128 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 
 const REPO_PATH = /^\/([A-Za-z0-9][A-Za-z0-9._-]{0,99})\/([A-Za-z0-9][A-Za-z0-9._-]{0,99})\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/;
 
-/** Build the server. It binds nothing until the caller listens. */
+/** Answer one parsed request. Transport-agnostic: the caller (raw TCP or
+    node:http) supplies method/path/query/headers/body and writes the
+    returned status + headers + body. */
+export async function routeRequest(req: RawRequest): Promise<RawResponse> {
+  try {
+    const method = req.method;
+    const { path, query: rawQuery } = splitUrl(req.target);
+    const headers = req.headers;
+    const body = req.body;
+
+    // The env's boot check calls this twice: 200 {"ok":true}.
+    if (method === 'GET' && path === '/healthz') {
+      return jsonResponse(200, { ok: true }, { 'x-github-request-id': appRequestId() });
+    }
+
+    // The GitHub API root: a 200 with the token's scopes.
+    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
+      return jsonResponse(
+        200,
+        { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' },
+        { 'x-oauth-scopes': 'repo, read:org', 'x-github-request-id': appRequestId() },
+      );
+    }
+
+    // GraphQL v4.
+    if (path === '/api/graphql' && method === 'POST') {
+      const result = handleGraphQL(forge, body.toString('utf8'), authorizedHeaders(headers));
+      return jsonResponse(result.status, result.json);
+    }
+
+    // MCP (Streamable HTTP). GET is the modern discovery probe.
+    if (path === '/mcp' && (method === 'POST' || method === 'GET')) {
+      const result = handleMcp(forge, method === 'GET' ? '' : body.toString('utf8'), authorizedHeaders(headers), method, headers);
+      if (result.json === undefined) {
+        return { status: result.status, contentType: JSON_TYPE, headers: result.headers ?? {}, body: Buffer.alloc(0) };
+      }
+      return jsonResponse(result.status, result.json, result.headers ?? {});
+    }
+
+    // Git smart HTTP.
+    const gitMatch = path.includes('.git/') ? REPO_PATH.exec(path) : null;
+    if (gitMatch !== null) {
+      const owner = gitMatch[1] as string;
+      const repoName = gitMatch[2] as string;
+      const service = gitMatch[3] as 'info/refs' | 'git-upload-pack' | 'git-receive-pack';
+      if (service === 'info/refs' && method === 'GET') {
+        const query = queryOf(rawQuery);
+        const wanted = query.get('service');
+        if (wanted !== 'git-upload-pack' && wanted !== 'git-receive-pack') {
+          return jsonResponse(400, { message: 'Bad Request' });
+        }
+        const result = handleInfoRefs(forge, owner, repoName, wanted, headers['git-protocol'] === 'version=2' ? '2' : undefined);
+        return bufferResponse(result.status, result.body, result.contentType);
+      }
+      if (service === 'git-upload-pack' && method === 'POST') {
+        const result = handleUploadPack(forge, owner, repoName, body, headers['git-protocol'] === 'version=2' ? '2' : undefined);
+        return bufferResponse(result.status, result.body, result.contentType);
+      }
+      if (service === 'git-receive-pack' && method === 'POST') {
+        const result = handleReceivePack(forge, owner, repoName, body);
+        return bufferResponse(result.status, result.body, result.contentType);
+      }
+      return jsonResponse(405, { message: 'Method Not Allowed' });
+    }
+
+    // REST v3.
+    if (path === '/api/v3' || path.startsWith('/api/v3/')) {
+      const query = queryOf(rawQuery);
+      const result = handleRest(forge, {
+        method,
+        pathname: path,
+        query,
+        headers,
+        bodyText: body.toString('utf8'),
+        origin: `http://${headers.host ?? 'localhost'}`,
+      });
+      return jsonResponse(result.status, result.json ?? { message: 'Not Found' }, result.headers ?? {});
+    }
+
+    // Everything else, every method: GitHub's 404 body.
+    return jsonResponse(404, { message: 'Not Found' });
+  } catch (err) {
+    return jsonResponse(500, { message: err instanceof Error ? err.message : 'Internal Server Error' });
+  }
+}
+
+/** Build the server (raw TCP). It binds nothing until the caller listens. */
 export function createApp(): Server {
+  return createRawServer((req) => routeRequest(req));
+}
+
+/** Build the server on node:http (fallback; same routing). */
+export function createNodeHttpApp(): HttpServer {
   // sendDate: false — no check reads the Date header, and generating +
-  // sending it on every response is pure overhead.
+  // sending it on every response is pure overhead. (Note: Node v24 still
+  // sends Date despite the option; the raw transport omits it outright.)
   // insecureHTTPParser: true — the suite's clients send well-formed
   // requests; the lenient parser skips strict header validation the
   // checks never exercise. requestTimeout: 0 — the per-request timeout
   // timer is pure overhead for fast local clients.
-  return createServer({ sendDate: false, insecureHTTPParser: true, requestTimeout: 0 }, (req: IncomingMessage, res: ServerResponse) => {
+  return createHttpServer({ sendDate: false, insecureHTTPParser: true, requestTimeout: 0 }, (req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
         const method = req.method ?? 'GET';
-        const { path, query: rawQuery } = splitUrl(req);
+        const target = req.url ?? '/';
         const headers = headersOf(req);
-
-        // The env's boot check calls this twice: 200 {"ok":true}.
-        if (method === 'GET' && path === '/healthz') {
-          sendJson(res, 200, { ok: true }, { 'x-github-request-id': appRequestId() });
-          return;
-        }
-
-        // The GitHub API root: a 200 with the token's scopes.
-        if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-          sendJson(
-            res,
-            200,
-            { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' },
-            { 'x-oauth-scopes': 'repo, read:org', 'x-github-request-id': appRequestId() },
-          );
-          return;
-        }
-
-        // GraphQL v4.
-        if (path === '/api/graphql' && method === 'POST') {
-          const body = await readBody(req);
-          const result = handleGraphQL(forge, body.toString('utf8'), authorized(req));
-          sendJson(res, result.status, result.json);
-          return;
-        }
-
-        // MCP (Streamable HTTP). GET is the modern discovery probe.
-        if (path === '/mcp' && (method === 'POST' || method === 'GET')) {
-          const body = method === 'GET' ? Buffer.alloc(0) : await readBody(req);
-          const result = handleMcp(forge, body.toString('utf8'), authorized(req), method, headers);
-          if (result.json === undefined) {
-            res.writeHead(result.status, { ...result.headers });
-            res.end();
-          } else {
-            sendJson(res, result.status, result.json, result.headers ?? {});
-          }
-          return;
-        }
-
-        // Git smart HTTP.
-        const gitMatch = path.includes('.git/') ? REPO_PATH.exec(path) : null;
-        if (gitMatch !== null) {
-          const owner = gitMatch[1] as string;
-          const repoName = gitMatch[2] as string;
-          const service = gitMatch[3] as 'info/refs' | 'git-upload-pack' | 'git-receive-pack';
-          if (service === 'info/refs' && method === 'GET') {
-            const query = queryOf(rawQuery);
-            const wanted = query.get('service');
-            if (wanted !== 'git-upload-pack' && wanted !== 'git-receive-pack') {
-              sendJson(res, 400, { message: 'Bad Request' });
-              return;
-            }
-            const result = handleInfoRefs(forge, owner, repoName, wanted, headers['git-protocol'] === 'version=2' ? '2' : undefined);
-            sendBuffer(res, result.status, result.body, result.contentType);
-            return;
-          }
-          if (service === 'git-upload-pack' && method === 'POST') {
-            const body = await readBody(req);
-            const result = handleUploadPack(forge, owner, repoName, body, headers['git-protocol'] === 'version=2' ? '2' : undefined);
-            sendBuffer(res, result.status, result.body, result.contentType);
-            return;
-          }
-          if (service === 'git-receive-pack' && method === 'POST') {
-            const body = await readBody(req);
-            const result = handleReceivePack(forge, owner, repoName, body);
-            sendBuffer(res, result.status, result.body, result.contentType);
-            return;
-          }
-          sendJson(res, 405, { message: 'Method Not Allowed' });
-          return;
-        }
-
-        // REST v3.
-        if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-          const query = queryOf(rawQuery);
-          const body = method === 'POST' || method === 'PATCH' || method === 'PUT' || method === 'DELETE' ? await readBody(req) : Buffer.alloc(0);
-          const result = handleRest(forge, {
-            method,
-            pathname: path,
-            query,
-            headers,
-            bodyText: body.toString('utf8'),
-            origin: `http://${req.headers.host ?? 'localhost'}`,
-          });
-          sendJson(res, result.status, result.json ?? { message: 'Not Found' }, result.headers ?? {});
-          return;
-        }
-
-        // Everything else, every method: GitHub's 404 body.
-        sendJson(res, 404, { message: 'Not Found' });
+        const { path } = splitUrl(target);
+        const needsBody =
+          (path === '/api/graphql' && method === 'POST') ||
+          (path === '/mcp' && method === 'POST') ||
+          (path.includes('.git/') && method === 'POST') ||
+          ((path === '/api/v3' || path.startsWith('/api/v3/')) &&
+            (method === 'POST' || method === 'PATCH' || method === 'PUT' || method === 'DELETE'));
+        const body = needsBody ? await readBody(req) : Buffer.alloc(0);
+        const result = await routeRequest({ method, target, headers, body });
+        res.writeHead(result.status, { 'content-type': result.contentType, 'content-length': result.body.length, ...result.headers });
+        res.end(result.body);
       } catch (err) {
         if (!res.headersSent) {
-          sendJson(res, 500, { message: err instanceof Error ? err.message : 'Internal Server Error' });
+          const buf = Buffer.from(`${JSON.stringify({ message: err instanceof Error ? err.message : 'Internal Server Error' })}\n`);
+          res.writeHead(500, { 'content-type': JSON_TYPE, 'content-length': buf.length });
+          res.end(buf);
         } else {
           res.destroy();
         }
