@@ -8,7 +8,9 @@ import {
   ZERO_OID,
   decodePktLines,
   parseTag,
+  pktLenAt,
   pktLine,
+  pktLineBand1,
   readPack,
   writePack,
   type Pkt,
@@ -133,9 +135,9 @@ function sidebandPackets(data: Buffer): Buffer[] {
   const CHUNK = 65515;
   for (let offset = 0; offset < data.length; offset += CHUNK) {
     const chunk = data.subarray(offset, Math.min(offset + CHUNK, data.length));
-    out.push(pktLine(Buffer.concat([Buffer.from([1]), chunk])));
+    out.push(pktLineBand1(chunk));
   }
-  if (out.length === 0) out.push(pktLine(Buffer.from([1])));
+  if (out.length === 0) out.push(pktLineBand1(Buffer.alloc(0)));
   return out;
 }
 
@@ -387,12 +389,11 @@ export function handleReceivePack(forge: Forge, owner: string, repoName: string,
   let seenFlush = false;
   let malformed = false;
   while (offset + 4 <= body.length) {
-    const lenText = body.subarray(offset, offset + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(lenText)) {
+    const len = pktLenAt(body, offset);
+    if (len < 0) {
       malformed = true;
       break;
     }
-    const len = parseInt(lenText, 16);
     if (len === 0) {
       offset += 4;
       seenFlush = true;

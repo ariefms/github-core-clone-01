@@ -31,13 +31,43 @@ export function hashBuffer(data: Buffer): string {
 
 // ---------------------------------------------------------------- pkt-lines
 
-/** One pkt-line: 4 hex length bytes (including themselves) + payload. */
+/** One pkt-line: 4 hex length bytes (including themselves) + payload.
+    One allocation: header + body in a single buffer (was Buffer.alloc(4)
+    + Buffer.concat per line). */
 export function pktLine(payload: Buffer | string): Buffer {
   const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   const len = body.length + 4;
-  const head = Buffer.alloc(4);
-  head.write(len.toString(16).padStart(4, '0'), 0, 'ascii');
-  return Buffer.concat([head, body]);
+  const out = Buffer.alloc(len);
+  out.write(len.toString(16).padStart(4, '0'), 0, 'ascii');
+  body.copy(out, 4);
+  return out;
+}
+
+/** A sideband band-1 pkt-line (band byte 0x01 + payload), one allocation. */
+export function pktLineBand1(chunk: Buffer): Buffer {
+  const len = chunk.length + 1 + 4;
+  const out = Buffer.alloc(len);
+  out.write(len.toString(16).padStart(4, '0'), 0, 'ascii');
+  out[4] = 1;
+  chunk.copy(out, 5);
+  return out;
+}
+
+/** Parse the 4 hex length bytes at `off` without allocating a string or
+    running a regex (the hot path read them per pkt-line). Returns the
+    length, or -1 when the 4 bytes are not hex. */
+export function pktLenAt(buf: Buffer, off: number): number {
+  let len = 0;
+  for (let i = 0; i < 4; i += 1) {
+    const b = buf[off + i] as number;
+    let v: number;
+    if (b >= 48 && b <= 57) v = b - 48; // 0-9
+    else if (b >= 97 && b <= 102) v = b - 87; // a-f
+    else if (b >= 65 && b <= 70) v = b - 55; // A-F
+    else return -1;
+    len = (len << 4) | v;
+  }
+  return len;
 }
 
 export const FLUSH = Buffer.from('0000', 'ascii');
@@ -59,9 +89,8 @@ export function decodePktLines(buf: Buffer): Pkt[] {
   let off = 0;
   while (off < buf.length) {
     if (off + 4 > buf.length) throw new Error('pkt-line truncated');
-    const lenHex = buf.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(lenHex)) throw new Error(`bad pkt-line length ${JSON.stringify(lenHex)}`);
-    const len = parseInt(lenHex, 16);
+    const len = pktLenAt(buf, off);
+    if (len < 0) throw new Error(`bad pkt-line length ${JSON.stringify(buf.subarray(off, off + 4).toString('ascii'))}`);
     if (len === 0) {
       out.push({ kind: 'flush', payload: Buffer.alloc(0) });
       off += 4;

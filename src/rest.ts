@@ -22,6 +22,9 @@ export interface RestContext {
 
 let requestCounter = 0;
 
+/** The trial token, read once: process.env is a slow accessor per request. */
+const EXPECTED_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+
 function ok(status: number, json: unknown, headers?: Record<string, string>): RestResult {
   return { status, json, headers };
 }
@@ -40,8 +43,7 @@ function authorized(ctx: RestContext): boolean {
   if (!header.startsWith('Bearer ')) return false;
   const token = header.slice('Bearer '.length);
   if (token === '') return false;
-  const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-  if (expected !== '') return token === expected;
+  if (EXPECTED_TOKEN !== '') return token === EXPECTED_TOKEN;
   return true;
 }
 
@@ -152,10 +154,30 @@ export function handleRest(forge: Forge, ctx: RestContext): RestResult {
   return { ...result, headers };
 }
 
+/** Split a pathname into non-empty segments, decoding % escapes only in
+    segments that contain one — the old split('/').filter().map() built
+    three intermediate arrays per request. Behavior identical: a bad %
+    escape still throws (callers turn it into a 500, as before). */
+function splitSegments(pathname: string): string[] {
+  const segments: string[] = [];
+  let start = 0;
+  for (let i = 0; i <= pathname.length; i += 1) {
+    if (i === pathname.length || pathname.charCodeAt(i) === 47 /* '/' */) {
+      if (i > start) {
+        let segment = pathname.slice(start, i);
+        if (segment.includes('%')) segment = decodeURIComponent(segment);
+        segments.push(segment);
+      }
+      start = i + 1;
+    }
+  }
+  return segments;
+}
+
 function routeRest(forge: Forge, ctx: RestContext): RestResult {
   const { method } = ctx;
   // The path arrives as /api/v3/...; strip the prefix, keep the full path for links.
-  const all = ctx.pathname.split('/').filter((s) => s !== '').map((s) => (s.includes('%') ? decodeURIComponent(s) : s));
+  const all = splitSegments(ctx.pathname);
   const segments = all[0] === 'api' && all[1] === 'v3' ? all.slice(2) : all;
   if (!authorized(ctx)) return err(401, 'Bad credentials');
   const { value: body, bad } = parseBody(ctx);

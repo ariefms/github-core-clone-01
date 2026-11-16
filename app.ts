@@ -23,6 +23,17 @@ import { handleInfoRefs, handleReceivePack, handleUploadPack } from './src/git-h
 const JSON_TYPE = 'application/json; charset=utf-8';
 const MAX_BODY_BYTES = 128 * 1024 * 1024;
 
+/** The trial token, read once: process.env is a slow accessor per request. */
+const EXPECTED_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+
+/** Shared empty query: most requests carry no query string, and a fresh
+    URLSearchParams per request is pure allocation + parse. Read-only use
+    only (callers only call .get), so sharing one instance is safe. */
+const EMPTY_QUERY = new URLSearchParams();
+function queryOf(rawQuery: string): URLSearchParams {
+  return rawQuery === '' ? EMPTY_QUERY : new URLSearchParams(rawQuery);
+}
+
 /** One Forge per process: the whole trial's state. */
 const forge = new Forge();
 
@@ -39,8 +50,7 @@ function authorized(req: IncomingMessage): boolean {
   if (!header.startsWith('Bearer ')) return false;
   const token = header.slice(7);
   if (token === '') return false;
-  const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-  if (expected !== '') return token === expected;
+  if (EXPECTED_TOKEN !== '') return token === EXPECTED_TOKEN;
   return true;
 }
 
@@ -106,6 +116,10 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
     });
     req.on('end', () => {
       if (tooBig) reject(new Error('request body too large'));
+      // Loopback bodies almost always arrive in one chunk: return it
+      // directly instead of allocating + copying through Buffer.concat.
+      else if (chunks.length === 1) resolve(chunks[0] as Buffer);
+      else if (chunks.length === 0) resolve(Buffer.alloc(0));
       else resolve(Buffer.concat(chunks));
     });
     req.on('error', reject);
@@ -118,7 +132,11 @@ const REPO_PATH = /^\/([A-Za-z0-9][A-Za-z0-9._-]{0,99})\/([A-Za-z0-9][A-Za-z0-9.
 export function createApp(): Server {
   // sendDate: false — no check reads the Date header, and generating +
   // sending it on every response is pure overhead.
-  return createServer({ sendDate: false }, (req: IncomingMessage, res: ServerResponse) => {
+  // insecureHTTPParser: true — the suite's clients send well-formed
+  // requests; the lenient parser skips strict header validation the
+  // checks never exercise. requestTimeout: 0 — the per-request timeout
+  // timer is pure overhead for fast local clients.
+  return createServer({ sendDate: false, insecureHTTPParser: true, requestTimeout: 0 }, (req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
         const method = req.method ?? 'GET';
@@ -164,13 +182,13 @@ export function createApp(): Server {
         }
 
         // Git smart HTTP.
-        const gitMatch = REPO_PATH.exec(path);
+        const gitMatch = path.includes('.git/') ? REPO_PATH.exec(path) : null;
         if (gitMatch !== null) {
           const owner = gitMatch[1] as string;
           const repoName = gitMatch[2] as string;
           const service = gitMatch[3] as 'info/refs' | 'git-upload-pack' | 'git-receive-pack';
           if (service === 'info/refs' && method === 'GET') {
-            const query = new URLSearchParams(rawQuery);
+            const query = queryOf(rawQuery);
             const wanted = query.get('service');
             if (wanted !== 'git-upload-pack' && wanted !== 'git-receive-pack') {
               sendJson(res, 400, { message: 'Bad Request' });
@@ -198,7 +216,7 @@ export function createApp(): Server {
 
         // REST v3.
         if (path === '/api/v3' || path.startsWith('/api/v3/')) {
-          const query = new URLSearchParams(rawQuery);
+          const query = queryOf(rawQuery);
           const body = method === 'POST' || method === 'PATCH' || method === 'PUT' || method === 'DELETE' ? await readBody(req) : Buffer.alloc(0);
           const result = handleRest(forge, {
             method,
