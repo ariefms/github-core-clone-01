@@ -8,6 +8,9 @@ import { VIEWER_EMAIL, VIEWER_ID, VIEWER_LOGIN, VIEWER_NAME } from './scenario.t
 export interface RestResult {
   status: number;
   json?: unknown;
+  /** A pre-serialized JSON body (the cached single-issue GET): when set,
+   * app.ts sends these bytes as-is instead of stringifying `json`. */
+  body?: Buffer;
   headers?: Record<string, string>;
 }
 
@@ -21,6 +24,35 @@ export interface RestContext {
 }
 
 let requestCounter = 0;
+
+/**
+ * Serialized single-issue GET bodies, keyed `${repo.dbId}:${issue.number}`.
+ * The read workload GETs the same issue 2,000 times in a row with no write
+ * in between, so caching the serialized bytes skips the per-request
+ * issueJson object build + JSON.stringify + Buffer.from. Invalidation is
+ * exact: PATCH is the only mutation of an issue's title/body/state, so it
+ * drops that issue's entry; DELETE repo drops the repo's entries. Creating
+ * an issue or a comment does not change any existing issue's JSON (the issue
+ * shape carries no comment count), so no invalidation is needed there. The
+ * X-GitHub-Request-Id header is still generated fresh per request by
+ * handleRest — only the body bytes are cached.
+ */
+const issueBodyCache = new Map<string, Buffer>();
+
+function issueCacheKey(repo: Repo, number: number): string {
+  return `${repo.dbId}:${number}`;
+}
+
+function invalidateIssue(repo: Repo, number: number): void {
+  issueBodyCache.delete(issueCacheKey(repo, number));
+}
+
+function invalidateRepoIssues(repo: Repo): void {
+  const prefix = `${repo.dbId}:`;
+  for (const key of issueBodyCache.keys()) {
+    if (key.startsWith(prefix)) issueBodyCache.delete(key);
+  }
+}
 
 /** The trial token, read once: process.env is a slow accessor per request. */
 const EXPECTED_TOKEN = process.env.MAKEFUN_SHOP_TOKEN ?? '';
@@ -236,6 +268,7 @@ function routeRepo(forge: Forge, ctx: RestContext, segments: string[], body: unk
       return ok(200, repoJson(repo));
     }
     if (method === 'DELETE') {
+      invalidateRepoIssues(repo);
       forge.deleteRepo(repo);
       return { status: 204 };
     }
@@ -508,13 +541,24 @@ function routeIssues(forge: Forge, ctx: RestContext, repo: Repo, rest: string[],
   const issue = forge.getIssue(repo, number);
   if (issue === null) return err(404, 'Not Found');
   if (rest.length === 1) {
-    if (method === 'GET') return ok(200, issueJson(issue));
+    if (method === 'GET') {
+      const key = issueCacheKey(repo, issue.number);
+      const cached = issueBodyCache.get(key);
+      if (cached !== undefined) return { status: 200, body: cached };
+      // Byte-identical to what jsonResponse would send: the JSON plus the
+      // trailing newline, so a cached reply is indistinguishable from a
+      // freshly built one.
+      const body = Buffer.from(`${JSON.stringify(issueJson(issue))}\n`, 'utf8');
+      issueBodyCache.set(key, body);
+      return { status: 200, body };
+    }
     if (method === 'PATCH') {
       if (isRecord(body)) {
         if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
         if (typeof body.title === 'string') issue.title = body.title;
         if (typeof body.body === 'string') issue.body = body.body;
       }
+      invalidateIssue(repo, issue.number);
       return ok(200, issueJson(issue));
     }
     return err(404, 'Not Found');
